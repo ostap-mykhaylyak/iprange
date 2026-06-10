@@ -579,6 +579,8 @@ final class Cli
           (reads stdin when no file is given; multiple files are merged)
 
         Operations:
+          --optimize, -J             merge and optimize to minimal CIDRs (default);
+                                     synonyms: --combine, --merge, --union
           --common FILE ...          intersection of preceding and following files
           --exclude-next FILE ...    remove IPs of following files from preceding ones
           --compare                  compare all files pairwise (CSV output)
@@ -636,6 +638,14 @@ final class Cli
         $bucket = 'filesA';
         while (($arg = array_shift($argv)) !== null) {
             switch ($arg) {
+                case '--optimize':
+                case '--combine':
+                case '--merge':
+                case '--union':
+                case '-J':
+                    $this->mode = 'union';
+                    $this->print = 'cidr';
+                    break;
                 case '--common':
                     $this->mode = 'common';
                     $bucket = 'filesB';
