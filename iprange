@@ -1,0 +1,886 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * iprange — pure-PHP reimplementation of iprange(1) with IPv6 support
+ *
+ * Merges, optimizes and compares IP address lists: CIDR aggregation, set
+ * operations, file comparison, DNS resolution and ipset reduction. Single
+ * file, CLI only, no dependencies or extensions required (PHP >= 8.5).
+ * Run `iprange --help` for usage.
+ *
+ * @package   iprange
+ * @author    Ostap Mykhaylyak
+ * @license   MIT
+ * @link      https://github.com/ostap-mykhaylyak/iprange
+ */
+
+namespace IPRangePhp;
+
+use RuntimeException;
+
+/**
+ * IP list engine.
+ *
+ * Addresses are fixed-length binary strings (4 bytes IPv4, 16 bytes IPv6),
+ * compared with strcmp and manipulated byte-wise, so no bignum extension
+ * is needed. A range is a [start, end] pair; a set is
+ * ['v4' => ranges, 'v6' => ranges].
+ */
+final class IPRange
+{
+    public const int SINGLE_IPS_LIMIT = 16_777_216;
+
+    private function __construct() {}
+
+    /* ---------------- conversions ---------------- */
+
+    public static function ipToBin(string $ip): ?string
+    {
+        $ip = trim($ip);
+        if ($ip === '') {
+            return null;
+        }
+        $bin = @inet_pton($ip);
+
+        return $bin === false ? null : $bin;
+    }
+
+    public static function binToIp(string $bin): string
+    {
+        $ip = inet_ntop($bin);
+        if ($ip === false) {
+            throw new RuntimeException('invalid binary address');
+        }
+
+        return $ip;
+    }
+
+    /** Increment by 1 (big-endian); null on overflow. */
+    public static function binInc(string $s): ?string
+    {
+        for ($i = strlen($s) - 1; $i >= 0; $i--) {
+            $b = ord($s[$i]);
+            if ($b < 255) {
+                $s[$i] = chr($b + 1);
+
+                return $s;
+            }
+            $s[$i] = "\x00";
+        }
+
+        return null;
+    }
+
+    /** Decrement by 1; null on underflow. */
+    public static function binDec(string $s): ?string
+    {
+        for ($i = strlen($s) - 1; $i >= 0; $i--) {
+            $b = ord($s[$i]);
+            if ($b > 0) {
+                $s[$i] = chr($b - 1);
+
+                return $s;
+            }
+            $s[$i] = "\xff";
+        }
+
+        return null;
+    }
+
+    private static function lowBitsZero(string $s, int $h): bool
+    {
+        $len = strlen($s);
+        $fullBytes = intdiv($h, 8);
+        for ($i = 0; $i < $fullBytes; $i++) {
+            if ($s[$len - 1 - $i] !== "\x00") {
+                return false;
+            }
+        }
+        $rem = $h % 8;
+        if ($rem !== 0 && (ord($s[$len - 1 - $fullBytes]) & ((1 << $rem) - 1)) !== 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static function setLowBits(string $s, int $h): string
+    {
+        $len = strlen($s);
+        $fullBytes = intdiv($h, 8);
+        for ($i = 0; $i < $fullBytes; $i++) {
+            $s[$len - 1 - $i] = "\xff";
+        }
+        $rem = $h % 8;
+        if ($rem !== 0) {
+            $idx = $len - 1 - $fullBytes;
+            $s[$idx] = chr(ord($s[$idx]) | ((1 << $rem) - 1));
+        }
+
+        return $s;
+    }
+
+    /* ---------------- parsing ---------------- */
+
+    /** Parse a single IP, CIDR block or a-b range. Returns [start, end] or null. */
+    public static function parseEntry(string $entry): ?array
+    {
+        $entry = trim($entry);
+        if ($entry === '') {
+            return null;
+        }
+
+        if (str_contains($entry, '/')) {
+            [$ip, $bits] = explode('/', $entry, 2);
+            $base = self::ipToBin($ip);
+            if ($base === null || !ctype_digit($bits)) {
+                return null;
+            }
+            $bits = (int) $bits;
+            $max = strlen($base) * 8;
+            if ($bits < 0 || $bits > $max) {
+                return null;
+            }
+            $h = $max - $bits;
+            // clear host bits to get the block start
+            $start = $base;
+            $len = strlen($start);
+            $fullBytes = intdiv($h, 8);
+            for ($i = 0; $i < $fullBytes; $i++) {
+                $start[$len - 1 - $i] = "\x00";
+            }
+            $rem = $h % 8;
+            if ($rem !== 0) {
+                $idx = $len - 1 - $fullBytes;
+                $start[$idx] = chr(ord($start[$idx]) & (0xFF << $rem) & 0xFF);
+            }
+
+            return [$start, self::setLowBits($start, $h)];
+        }
+
+        if (str_contains($entry, '-')) {
+            [$a, $b] = explode('-', $entry, 2);
+            $s = self::ipToBin($a);
+            $e = self::ipToBin($b);
+            if ($s === null || $e === null || strlen($s) !== strlen($e) || strcmp($e, $s) < 0) {
+                return null;
+            }
+
+            return [$s, $e];
+        }
+
+        $s = self::ipToBin($entry);
+
+        return $s === null ? null : [$s, $s];
+    }
+
+    public static function looksLikeHostname(string $tok): bool
+    {
+        return (bool) preg_match(
+            '/^(?=.*[a-z])[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+\.?$/i',
+            $tok,
+        );
+    }
+
+    /** Resolve a hostname to its A and AAAA records as single-IP ranges. */
+    public static function resolveHostname(string $name): array
+    {
+        $out = [];
+        $recs = @dns_get_record(rtrim($name, '.'), DNS_A + DNS_AAAA);
+        if (is_array($recs)) {
+            foreach ($recs as $r) {
+                $ip = $r['ip'] ?? $r['ipv6'] ?? null;
+                if ($ip !== null && ($bin = self::ipToBin($ip)) !== null) {
+                    $out[] = [$bin, $bin];
+                }
+            }
+        }
+        if ($out === []) {
+            $ip = @gethostbyname($name);
+            if ($ip !== $name && ($bin = self::ipToBin($ip)) !== null) {
+                $out[] = [$bin, $bin];
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Parse text into raw ranges grouped by family. Blank lines and #
+     * comments are ignored; entries may be separated by spaces or commas.
+     * With $dns enabled, hostname tokens are resolved.
+     */
+    public static function parseText(string|array $lines, bool $dns = true, ?array &$invalid = null): array
+    {
+        if (is_string($lines)) {
+            $lines = preg_split('/\r\n|\r|\n/', $lines) ?: [];
+        }
+        $out = ['v4' => [], 'v6' => []];
+        $invalid = [];
+        foreach ($lines as $line) {
+            $hash = strpos($line, '#');
+            if ($hash !== false) {
+                $line = substr($line, 0, $hash);
+            }
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            foreach (preg_split('/[\s,;]+/', $line) ?: [] as $tok) {
+                if ($tok === '') {
+                    continue;
+                }
+                $r = self::parseEntry($tok);
+                if ($r !== null) {
+                    $out[strlen($r[0]) === 4 ? 'v4' : 'v6'][] = $r;
+                    continue;
+                }
+                if ($dns && self::looksLikeHostname($tok)) {
+                    $resolved = self::resolveHostname($tok);
+                    if ($resolved !== []) {
+                        foreach ($resolved as $rr) {
+                            $out[strlen($rr[0]) === 4 ? 'v4' : 'v6'][] = $rr;
+                        }
+                        continue;
+                    }
+                }
+                $invalid[] = $tok;
+            }
+        }
+
+        return $out;
+    }
+
+    /* ---------------- set operations ---------------- */
+
+    /** Sort and merge overlapping or adjacent ranges of the same family. */
+    public static function merge(array $ranges): array
+    {
+        if ($ranges === []) {
+            return [];
+        }
+        usort($ranges, static fn (array $a, array $b): int => strcmp($a[0], $b[0]) ?: strcmp($a[1], $b[1]));
+        $out = [];
+        $cur = $ranges[0];
+        for ($i = 1, $n = count($ranges); $i < $n; $i++) {
+            $r = $ranges[$i];
+            $next = self::binInc($cur[1]);
+            if ($next === null || strcmp($r[0], $next) <= 0) {
+                if (strcmp($r[1], $cur[1]) > 0) {
+                    $cur[1] = $r[1];
+                }
+            } else {
+                $out[] = $cur;
+                $cur = $r;
+            }
+        }
+        $out[] = $cur;
+
+        return $out;
+    }
+
+    /** Intersection of two merged sets. */
+    public static function intersect(array $a, array $b): array
+    {
+        $out = [];
+        $i = $j = 0;
+        $na = count($a);
+        $nb = count($b);
+        while ($i < $na && $j < $nb) {
+            $s = strcmp($a[$i][0], $b[$j][0]) >= 0 ? $a[$i][0] : $b[$j][0];
+            $e = strcmp($a[$i][1], $b[$j][1]) <= 0 ? $a[$i][1] : $b[$j][1];
+            if (strcmp($s, $e) <= 0) {
+                $out[] = [$s, $e];
+            }
+            if (strcmp($a[$i][1], $b[$j][1]) < 0) {
+                $i++;
+            } else {
+                $j++;
+            }
+        }
+
+        return $out;
+    }
+
+    /** Difference a \ b of two merged sets. */
+    public static function subtract(array $a, array $b): array
+    {
+        $out = [];
+        $j = 0;
+        $nb = count($b);
+        foreach ($a as $r) {
+            [$s, $e] = $r;
+            while ($j < $nb && strcmp($b[$j][1], $s) < 0) {
+                $j++;
+            }
+            $k = $j;
+            while ($k < $nb && strcmp($b[$k][0], $e) <= 0) {
+                if (strcmp($b[$k][0], $s) > 0) {
+                    $out[] = [$s, (string) self::binDec($b[$k][0])];
+                }
+                $s = self::binInc($b[$k][1]);
+                if ($s === null || strcmp($s, $e) > 0) {
+                    $s = null;
+                    break;
+                }
+                $k++;
+            }
+            if ($s !== null && strcmp($s, $e) <= 0) {
+                $out[] = [$s, $e];
+            }
+        }
+
+        return $out;
+    }
+
+    /* ---------------- counting (arbitrary-precision decimal) ----------- */
+
+    public static function decAdd(string $a, string $b): string
+    {
+        $i = strlen($a) - 1;
+        $j = strlen($b) - 1;
+        $carry = 0;
+        $res = '';
+        while ($i >= 0 || $j >= 0 || $carry !== 0) {
+            $sum = $carry + ($i >= 0 ? (int) $a[$i--] : 0) + ($j >= 0 ? (int) $b[$j--] : 0);
+            $res = ($sum % 10) . $res;
+            $carry = intdiv($sum, 10);
+        }
+
+        return $res;
+    }
+
+    private static function decMulAdd(string $dec, int $m, int $add): string
+    {
+        $carry = $add;
+        $res = '';
+        for ($i = strlen($dec) - 1; $i >= 0; $i--) {
+            $v = (int) $dec[$i] * $m + $carry;
+            $res = ($v % 10) . $res;
+            $carry = intdiv($v, 10);
+        }
+        while ($carry !== 0) {
+            $res = ($carry % 10) . $res;
+            $carry = intdiv($carry, 10);
+        }
+        $res = ltrim($res, '0');
+
+        return $res === '' ? '0' : $res;
+    }
+
+    /** Total unique IPs in merged ranges, as a decimal string. */
+    public static function countIPs(array $ranges): string
+    {
+        $total = '0';
+        foreach ($ranges as $r) {
+            $len = strlen($r[0]);
+            $diff = [];
+            $borrow = 0;
+            for ($i = $len - 1; $i >= 0; $i--) {
+                $d = ord($r[1][$i]) - ord($r[0][$i]) - $borrow;
+                if ($d < 0) {
+                    $d += 256;
+                    $borrow = 1;
+                } else {
+                    $borrow = 0;
+                }
+                $diff[$i] = $d;
+            }
+            ksort($diff);
+            $dec = '0';
+            foreach ($diff as $byte) {
+                $dec = self::decMulAdd($dec, 256, $byte);
+            }
+            $total = self::decAdd($total, self::decAdd($dec, '1'));
+        }
+
+        return $total;
+    }
+
+    /* ---------------- output ---------------- */
+
+    /**
+     * Convert disjoint ranges to the minimal set of CIDR blocks.
+     * Returns [startBin, prefixLen] pairs. $minPrefix splits blocks
+     * larger than /N.
+     */
+    public static function toCIDRBlocks(array $ranges, ?int $minPrefix = null): array
+    {
+        $out = [];
+        foreach ($ranges as $r) {
+            [$start, $end] = $r;
+            $bits = strlen($start) * 8;
+            while ($start !== null && strcmp($start, $end) <= 0) {
+                $h = 0;
+                while ($h < $bits) {
+                    if (!self::lowBitsZero($start, $h + 1)) {
+                        break;
+                    }
+                    if (strcmp(self::setLowBits($start, $h + 1), $end) > 0) {
+                        break;
+                    }
+                    $h++;
+                }
+                if ($minPrefix !== null && ($bits - $h) < $minPrefix) {
+                    $h = $bits - $minPrefix;
+                }
+                $out[] = [$start, $bits - $h];
+                $start = self::binInc(self::setLowBits($start, $h));
+            }
+        }
+
+        return $out;
+    }
+
+    public static function cidrToString(array $block): string
+    {
+        return self::binToIp($block[0]) . '/' . $block[1];
+    }
+
+    public static function toCIDRs(array $ranges, ?int $minPrefix = null): array
+    {
+        return array_map(self::cidrToString(...), self::toCIDRBlocks($ranges, $minPrefix));
+    }
+
+    public static function toRanges(array $ranges): array
+    {
+        $out = [];
+        foreach ($ranges as $r) {
+            $out[] = strcmp($r[0], $r[1]) === 0
+                ? self::binToIp($r[0])
+                : self::binToIp($r[0]) . '-' . self::binToIp($r[1]);
+        }
+
+        return $out;
+    }
+
+    public static function toSingleIPs(array $ranges, int $limit = self::SINGLE_IPS_LIMIT): array
+    {
+        $out = [];
+        foreach ($ranges as $r) {
+            $ip = $r[0];
+            while ($ip !== null && strcmp($ip, $r[1]) <= 0) {
+                $out[] = self::binToIp($ip);
+                if (count($out) > $limit) {
+                    throw new RuntimeException("too many IPs to expand (limit $limit)");
+                }
+                $ip = self::binInc($ip);
+            }
+        }
+
+        return $out;
+    }
+
+    /* ---------------- ipset reduction (IPv4 only) ---------------- */
+
+    /**
+     * Reduce the number of CIDR entries by allowing up to $percent% extra
+     * coverage, for use with ipset hash:net. No reduction below $minEntries.
+     * Greedy: repeatedly merges entries into the cheapest common ancestor
+     * block (added IPs per saved entry).
+     */
+    public static function ipsetReduce(array $ranges, float $percent = 20.0, int $minEntries = 16384): array
+    {
+        $blocks = self::toCIDRBlocks($ranges);
+        if (count($blocks) <= $minEntries) {
+            return $blocks;
+        }
+
+        $entries = [];
+        foreach ($blocks as $b) {
+            $entries[] = [unpack('N', $b[0])[1] & 0xFFFFFFFF, $b[1]];
+        }
+        $sizeOf = static fn (int $prefix): int => 2 ** (32 - $prefix);
+        $totalIPs = 0;
+        foreach ($entries as $e) {
+            $totalIPs += $sizeOf($e[1]);
+        }
+        $budget = (int) floor($totalIPs * $percent / 100);
+
+        usort($entries, static fn (array $a, array $b): int => $a[0] <=> $b[0] ?: $a[1] <=> $b[1]);
+
+        while (count($entries) > $minEntries) {
+            $best = null;
+            $bestRatio = null;
+            $n = count($entries);
+            for ($i = 0; $i < $n - 1; $i++) {
+                // smallest common ancestor block of entries[i] and entries[i+1]
+                $p = max(0, min($entries[$i][1], $entries[$i + 1][1]) - 1);
+                while ($p > 0 && intdiv($entries[$i][0], $sizeOf($p)) !== intdiv($entries[$i + 1][0], $sizeOf($p))) {
+                    $p--;
+                }
+                $size = $sizeOf($p);
+                $start = $entries[$i][0] - ($entries[$i][0] % $size);
+                $endExcl = $start + $size;
+                // members form a contiguous span (entries are sorted, disjoint)
+                $covered = 0;
+                $first = $i;
+                while ($first > 0 && $entries[$first - 1][0] >= $start) {
+                    $first--;
+                }
+                $last = $first;
+                while ($last < $n && $entries[$last][0] < $endExcl) {
+                    $covered += $sizeOf($entries[$last][1]);
+                    $last++;
+                }
+                $saved = ($last - $first) - 1;
+                $added = $size - $covered;
+                if ($saved < 1 || $added > $budget) {
+                    continue;
+                }
+                $ratio = $added / $saved;
+                if ($bestRatio === null || $ratio < $bestRatio) {
+                    $bestRatio = $ratio;
+                    $best = ['start' => $start, 'prefix' => $p, 'first' => $first, 'last' => $last, 'added' => $added];
+                }
+            }
+            if ($best === null) {
+                break;
+            }
+            $budget -= $best['added'];
+            array_splice($entries, $best['first'], $best['last'] - $best['first'], [[$best['start'], $best['prefix']]]);
+        }
+
+        $out = [];
+        foreach ($entries as $e) {
+            $out[] = [pack('N', $e[0]), $e[1]];
+        }
+
+        return $out;
+    }
+
+    /* ---------------- comparison ---------------- */
+
+    /** Compare two normalized sets. Returns [ips1, ips2, common] as decimals. */
+    public static function compareSets(array $a, array $b): array
+    {
+        $ips1 = $ips2 = $common = '0';
+        foreach (['v4', 'v6'] as $fam) {
+            $ips1 = self::decAdd($ips1, self::countIPs($a[$fam]));
+            $ips2 = self::decAdd($ips2, self::countIPs($b[$fam]));
+            $common = self::decAdd($common, self::countIPs(self::intersect($a[$fam], $b[$fam])));
+        }
+
+        return [$ips1, $ips2, $common];
+    }
+}
+
+/**
+ * Command-line interface, option-compatible with iprange(1).
+ */
+final class Cli
+{
+    private const string USAGE = <<<TXT
+        Usage: iprange [options] [file ...]
+          (reads stdin when no file is given; multiple files are merged)
+
+        Operations:
+          --common FILE ...          intersection of preceding and following files
+          --exclude-next FILE ...    remove IPs of following files from preceding ones
+          --compare                  compare all files pairwise (CSV output)
+          --compare-first            compare the first file with each of the others
+          --compare-next FILE ...    compare preceding files with following ones
+
+        Output:
+          --print-ranges, -j         print a-b ranges instead of CIDRs
+          --print-single-ips, -1     print one IP per line
+          --count-unique, -C         print only the number of unique IPs
+          --min-prefix N             no prefix shorter than /N
+          --ipset-reduce PERCENT     allow PERCENT% extra IPs to reduce entries
+          --ipset-reduce-entries N   do not reduce below N entries (default 16384)
+
+        Input:
+          --no-dns                   do not resolve hostnames found in input
+          --help, -h                 show this help
+        TXT;
+
+    private const array FAMILIES = ['v4', 'v6'];
+
+    private array $filesA = [];
+    private array $filesB = [];
+    private string $mode = 'union';   // union|common|exclude|compare|compare-first|compare-next
+    private string $print = 'cidr';   // cidr|ranges|single|count
+    private ?int $minPrefix = null;
+    private ?float $reducePercent = null;
+    private int $reduceEntries = 16384;
+    private bool $dns = true;
+    private array $cache = [];
+
+    public function run(array $argv): int
+    {
+        array_shift($argv);
+        $err = $this->parseArgs($argv);
+        if ($err !== null) {
+            return $err;
+        }
+
+        if (in_array($this->mode, ['compare', 'compare-first', 'compare-next'], true)) {
+            return $this->runCompare();
+        }
+
+        $result = $this->computeSet();
+        if ($result === null) {
+            return 1;
+        }
+        $this->output($result);
+
+        return 0;
+    }
+
+    private function parseArgs(array $argv): ?int
+    {
+        $bucket = 'filesA';
+        while (($arg = array_shift($argv)) !== null) {
+            switch ($arg) {
+                case '--common':
+                    $this->mode = 'common';
+                    $bucket = 'filesB';
+                    break;
+                case '--exclude-next':
+                    $this->mode = 'exclude';
+                    $bucket = 'filesB';
+                    break;
+                case '--compare':
+                    $this->mode = 'compare';
+                    break;
+                case '--compare-first':
+                    $this->mode = 'compare-first';
+                    break;
+                case '--compare-next':
+                    $this->mode = 'compare-next';
+                    $bucket = 'filesB';
+                    break;
+                case '--print-ranges':
+                case '-j':
+                    $this->print = 'ranges';
+                    break;
+                case '--print-single-ips':
+                case '-1':
+                    $this->print = 'single';
+                    break;
+                case '--count-unique':
+                case '-C':
+                    $this->print = 'count';
+                    break;
+                case '--no-dns':
+                    $this->dns = false;
+                    break;
+                case '--min-prefix':
+                    $this->minPrefix = (int) array_shift($argv);
+                    if ($this->minPrefix < 1 || $this->minPrefix > 128) {
+                        fwrite(STDERR, "min-prefix must be 1..128\n");
+
+                        return 1;
+                    }
+                    break;
+                case '--ipset-reduce':
+                    $this->reducePercent = (float) array_shift($argv);
+                    break;
+                case '--ipset-reduce-entries':
+                    $this->reduceEntries = (int) array_shift($argv);
+                    break;
+                case '--help':
+                case '-h':
+                    echo self::USAGE, "\n";
+
+                    return 0;
+                default:
+                    if ($arg !== '' && $arg !== '-' && $arg[0] === '-') {
+                        fwrite(STDERR, "unknown option: $arg\n" . self::USAGE . "\n");
+
+                        return 1;
+                    }
+                    $this->{$bucket}[] = $arg;
+            }
+        }
+
+        return null;
+    }
+
+    /** Read and normalize one or more files into a set; '-' means stdin. */
+    private function readSet(array $files): ?array
+    {
+        $acc = ['v4' => [], 'v6' => []];
+        if ($files === []) {
+            $files = ['-'];
+        }
+        foreach ($files as $f) {
+            $data = $f === '-' ? stream_get_contents(STDIN) : @file_get_contents($f);
+            if ($data === false) {
+                fwrite(STDERR, "cannot read: $f\n");
+
+                return null;
+            }
+            $invalid = [];
+            $parsed = IPRange::parseText($data, $this->dns, $invalid);
+            foreach ($invalid as $bad) {
+                fwrite(STDERR, "ignored entry: $bad\n");
+            }
+            foreach (self::FAMILIES as $fam) {
+                $acc[$fam] = array_merge($acc[$fam], $parsed[$fam]);
+            }
+        }
+
+        return ['v4' => IPRange::merge($acc['v4']), 'v6' => IPRange::merge($acc['v6'])];
+    }
+
+    private function readSetCached(string $file): ?array
+    {
+        return $this->cache[$file] ??= $this->readSet([$file]);
+    }
+
+    private function runCompare(): int
+    {
+        $pairs = match ($this->mode) {
+            'compare' => $this->pairsAll(),
+            'compare-first' => $this->pairsFirst(),
+            default => $this->pairsNext(),
+        };
+        if ($pairs === null) {
+            return 1;
+        }
+
+        echo "name1,name2,ips1,ips2,common,common%_of_1,common%_of_2\n";
+        foreach ($pairs as [$f1, $f2]) {
+            $set1 = $this->readSetCached($f1);
+            $set2 = $this->readSetCached($f2);
+            if ($set1 === null || $set2 === null) {
+                return 1;
+            }
+            [$ips1, $ips2, $common] = IPRange::compareSets($set1, $set2);
+            $p1 = (float) $ips1 > 0 ? round((float) $common / (float) $ips1 * 100, 2) : 0.0;
+            $p2 = (float) $ips2 > 0 ? round((float) $common / (float) $ips2 * 100, 2) : 0.0;
+            echo "$f1,$f2,$ips1,$ips2,$common,$p1,$p2\n";
+        }
+
+        return 0;
+    }
+
+    private function pairsAll(): ?array
+    {
+        $n = count($this->filesA);
+        if ($n < 2) {
+            fwrite(STDERR, "--compare requires at least 2 files\n");
+
+            return null;
+        }
+        $pairs = [];
+        for ($i = 0; $i < $n; $i++) {
+            for ($j = $i + 1; $j < $n; $j++) {
+                $pairs[] = [$this->filesA[$i], $this->filesA[$j]];
+            }
+        }
+
+        return $pairs;
+    }
+
+    private function pairsFirst(): ?array
+    {
+        $n = count($this->filesA);
+        if ($n < 2) {
+            fwrite(STDERR, "--compare-first requires at least 2 files\n");
+
+            return null;
+        }
+        $pairs = [];
+        for ($j = 1; $j < $n; $j++) {
+            $pairs[] = [$this->filesA[0], $this->filesA[$j]];
+        }
+
+        return $pairs;
+    }
+
+    private function pairsNext(): ?array
+    {
+        if ($this->filesA === [] || $this->filesB === []) {
+            fwrite(STDERR, "--compare-next requires files before and after the option\n");
+
+            return null;
+        }
+        $pairs = [];
+        foreach ($this->filesA as $fa) {
+            foreach ($this->filesB as $fb) {
+                $pairs[] = [$fa, $fb];
+            }
+        }
+
+        return $pairs;
+    }
+
+    private function computeSet(): ?array
+    {
+        $setA = $this->readSet($this->filesA);
+        if ($setA === null) {
+            return null;
+        }
+        if ($this->mode === 'union') {
+            return $setA;
+        }
+        $setB = $this->readSet($this->filesB);
+        if ($setB === null) {
+            return null;
+        }
+        $result = ['v4' => [], 'v6' => []];
+        foreach (self::FAMILIES as $fam) {
+            $result[$fam] = $this->mode === 'common'
+                ? IPRange::intersect($setA[$fam], $setB[$fam])
+                : IPRange::subtract($setA[$fam], $setB[$fam]);
+        }
+
+        return $result;
+    }
+
+    private function output(array $result): void
+    {
+        switch ($this->print) {
+            case 'count':
+                $tot = '0';
+                foreach (self::FAMILIES as $fam) {
+                    $tot = IPRange::decAdd($tot, IPRange::countIPs($result[$fam]));
+                }
+                echo $tot, "\n";
+                break;
+            case 'ranges':
+                foreach (self::FAMILIES as $fam) {
+                    foreach (IPRange::toRanges($result[$fam]) as $line) {
+                        echo $line, "\n";
+                    }
+                }
+                break;
+            case 'single':
+                foreach (self::FAMILIES as $fam) {
+                    foreach (IPRange::toSingleIPs($result[$fam]) as $line) {
+                        echo $line, "\n";
+                    }
+                }
+                break;
+            default:
+                if ($this->reducePercent !== null) {
+                    // ipset-reduce applies to IPv4 only; IPv6 passes through
+                    foreach (IPRange::ipsetReduce($result['v4'], $this->reducePercent, $this->reduceEntries) as $b) {
+                        echo IPRange::cidrToString($b), "\n";
+                    }
+                    foreach (IPRange::toCIDRs($result['v6'], $this->minPrefix) as $line) {
+                        echo $line, "\n";
+                    }
+                } else {
+                    foreach (self::FAMILIES as $fam) {
+                        foreach (IPRange::toCIDRs($result[$fam], $this->minPrefix) as $line) {
+                            echo $line, "\n";
+                        }
+                    }
+                }
+        }
+    }
+}
+
+// Run the CLI only when executed directly.
+if (PHP_SAPI === 'cli'
+    && isset($argv[0])
+    && realpath($argv[0]) === __FILE__
+) {
+    exit(new Cli()->run($argv));
+}

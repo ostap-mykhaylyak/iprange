@@ -1,0 +1,14 @@
+{
+    "name": "ostap-mykhaylyak/iprange",
+    "homepage": "https://github.com/ostap-mykhaylyak/iprange",
+    "description": "Pure-PHP single-file reimplementation of iprange(1): merge, optimize and compare IP lists (CIDR aggregation, set operations, DNS resolution, ipset reduction) with IPv4 and IPv6 support. No extensions, no dependencies.",
+    "type": "project",
+    "license": "MIT",
+    "keywords": ["iprange", "cidr", "ipset", "ip", "ipv4", "ipv6", "blocklist", "firewall"],
+    "require": {
+        "php": ">=8.5"
+    },
+    "bin": [
+        "iprange"
+    ]
+}

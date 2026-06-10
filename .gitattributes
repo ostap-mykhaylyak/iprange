@@ -1,0 +1,3 @@
+# The "iprange" shebang requires LF endings, including on Windows checkouts.
+* text=auto eol=lf
+iprange text eol=lf
