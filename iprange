@@ -136,7 +136,8 @@ final class IPRange
         if (str_contains($entry, '/')) {
             [$ip, $bits] = explode('/', $entry, 2);
             $base = self::ipToBin($ip);
-            if ($base === null || !ctype_digit($bits)) {
+            // strspn instead of ctype_digit: the ctype extension may be disabled
+            if ($base === null || $bits === '' || strspn($bits, '0123456789') !== strlen($bits)) {
                 return null;
             }
             $bits = (int) $bits;
